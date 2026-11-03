@@ -27,6 +27,7 @@ from platforms import (
     parse_show_url,
     fetch_episodes,
     build_watch_link,
+    search_episode_online,
     get_supported_platforms,
 )
 from platforms.base import parse_episode_details, extract_thumbnail_url
@@ -383,6 +384,22 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
         else:
             target_ep = episodes[0]
+
+    # Query search engine index if not found in cache/live scrape
+    if not target_ep and ep_num_query:
+        online_match = await asyncio.to_thread(
+            search_episode_online,
+            matched_show["show_slug"],
+            matched_show["show_id"],
+            ep_num_query,
+            from_ott
+        )
+        if online_match and online_match.get("id"):
+            target_ep = online_match
+            # Cache it so future lookups are instant
+            cached = matched_show.get("cached_episodes") or []
+            cached.insert(0, target_ep)
+            db.db_update_cached_episodes(matched_show["show_id"], cached)
 
     # Fallback if specific episode wasn't found in list or scraper was throttled
     if not target_ep:

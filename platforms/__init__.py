@@ -78,5 +78,12 @@ def build_watch_link(show_slug: str, show_id: str, ep_name: str, ep_id: str, pla
     return handler.build_watch_link(show_slug, show_id, ep_name, ep_id, raw_url=raw_url)
 
 
+def search_episode_online(show_slug: str, show_id: str, ep_number: str, platform_name: str) -> dict | None:
+    handler = get_platform_handler(platform_name)
+    if hasattr(handler, "search_episode_online"):
+        return handler.search_episode_online(show_slug, show_id, ep_number)
+    return None
+
+
 def get_supported_platforms() -> list[str]:
     return [p.NAME for p in PLATFORMS]

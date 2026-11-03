@@ -1,5 +1,7 @@
 import re
 import json
+import urllib.parse
+import requests
 import yt_dlp
 from platforms.base import slugify, COMMON_HEADERS
 
@@ -21,16 +23,9 @@ class HotstarPlatform:
 
     @classmethod
     def parse_url(cls, url: str) -> tuple[str, str, str, str] | None:
-        """
-        Extracts (slug, show_id, serial_name, canonical_url) from ANY Hotstar link.
-        Automatically converts unsupported watch links like:
-          https://www.hotstar.com/in/shows/bigg-boss/17932/watch
-        Into canonical series URLs:
-          https://www.hotstar.com/in/shows/bigg-boss/17932
-        """
+        """Extracts (slug, show_id, serial_name, canonical_url) from ANY Hotstar link."""
         clean = url.split("?")[0].rstrip("/")
 
-        # Match /shows/<slug>/<show_id>(/watch or /any/subpath)?
         match = re.search(r"hotstar\.com/(?:[a-z]{2}/)?shows/([^/]+)/(\d+)", clean)
         if match:
             slug, show_id = match.group(1), match.group(2)
@@ -38,7 +33,6 @@ class HotstarPlatform:
             canonical_url = f"https://www.hotstar.com/in/shows/{slug}/{show_id}"
             return slug, show_id, serial_name, canonical_url
 
-        # Match short ID format: /<id>/watch
         match_short = re.search(r"hotstar\.com/(?:[a-z]{2}/)?(\d+)(?:/watch)?", clean)
         if match_short:
             content_id = match_short.group(1)
@@ -49,32 +43,84 @@ class HotstarPlatform:
 
     @classmethod
     def build_watch_link(cls, show_slug: str, show_id: str, ep_name: str, ep_id: str, raw_url: str = None) -> str:
+        """
+        Builds canonical watch URL.
+        Guarantees that if ep_id is not a real 8+ digit video asset, it links
+        safely to the show page instead of generating an invalid watch link.
+        """
         if raw_url and raw_url.startswith("http") and "/watch" in raw_url:
             return raw_url
+
+        # Prevent duplicate show_id in watch path (e.g. .../<show_id>/episode-1115/<show_id>/watch)
+        if not ep_id or ep_id == show_id or not ep_id.isdigit() or len(ep_id) < 8:
+            return f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}"
+
         ep_slug = slugify(ep_name)
-        if ep_slug:
+        if ep_slug and ep_slug not in ["episode", "latest-episode"]:
             return f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch"
-        return f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_id}/watch"
+        return f"https://www.hotstar.com/{ep_id}/watch"
 
     @classmethod
     def _make_http_get(cls, url: str, headers: dict):
-        """HTTP GET with Chrome TLS impersonation (bypasses Akamai/Cloudflare 403 & 475)."""
         if HAS_CURL_CFFI:
             try:
                 return cffi_requests.get(url, headers=headers, impersonate="chrome124", timeout=15)
             except Exception as e:
-                print(f"[!] curl_cffi error ({e}), falling back to standard requests")
-        import requests
+                print(f"[!] curl_cffi error ({e}), falling back to requests")
         return requests.get(url, headers=headers, timeout=15)
 
     @classmethod
+    def search_episode_online(cls, show_slug: str, show_id: str, ep_number: str) -> dict | None:
+        """
+        Uses search engine indexing to find the real Hotstar episode title and 10-digit watch URL.
+        Bypasses datacenter IP blocks and geo-restrictions.
+        """
+        queries = [
+            f"site:hotstar.com/in/shows/{show_slug} \"{ep_number}\"",
+            f"site:hotstar.com/in/shows/{show_slug} \"Episode {ep_number}\"",
+            f"site:hotstar.com/in/shows/{show_slug}/{show_id} \"{ep_number}\"",
+        ]
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        for q in queries:
+            try:
+                url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
+                resp = requests.get(url, headers=headers, timeout=8)
+                if resp.status_code == 200:
+                    matches = re.findall(r'uddg=(https%3A%2F%2F(?:www\.)?hotstar\.com[^&"\']+)', resp.text)
+                    for m in matches:
+                        clean_link = urllib.parse.unquote(m).split("?")[0]
+                        match_watch = re.search(r'shows/[^/]+/\d+/([^/]+)/(\d{8,12})/watch', clean_link)
+                        if match_watch:
+                            ep_slug = match_watch.group(1)
+                            ep_id = match_watch.group(2)
+                            ep_name = ep_slug.replace("-", " ").title()
+                            return {
+                                "id": ep_id,
+                                "title": f"Episode {ep_number} - {ep_name}",
+                                "season_number": "1",
+                                "url": clean_link,
+                            }
+                        match_num = re.search(r'/(\d{8,12})/watch', clean_link)
+                        if match_num:
+                            ep_id = match_num.group(1)
+                            return {
+                                "id": ep_id,
+                                "title": f"Episode {ep_number}",
+                                "season_number": "1",
+                                "url": clean_link,
+                            }
+            except Exception as e:
+                print(f"[!] Online search error for query '{q}': {e}")
+
+        return None
+
+    @classmethod
     def fetch_episodes(cls, show_url: str) -> list[dict]:
-        """
-        Multi-strategy episode extractor:
-        1. Direct Next.js webpage scrape with Chrome TLS impersonation
-        2. Hotstar internal layout API
-        3. yt-dlp fallback
-        """
         clean_url = show_url.split("?")[0].rstrip("/")
         if clean_url.endswith("/watch"):
             clean_url = clean_url[:-6]
@@ -93,13 +139,13 @@ class HotstarPlatform:
         entries = []
         seen_ids = set()
 
-        # ================= STRATEGY 1: Webpage Scrape =================
+        # Strategy 1: Webpage Scrape
         try:
             resp = cls._make_http_get(clean_url, headers)
             if resp.status_code == 200:
                 html = resp.text
 
-                # 1. Parse Next.js __NEXT_DATA__
+                # Parse __NEXT_DATA__
                 next_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html)
                 if next_match:
                     try:
@@ -144,7 +190,7 @@ class HotstarPlatform:
                     except Exception as json_err:
                         print(f"[!] Error reading Hotstar __NEXT_DATA__: {json_err}")
 
-                # 2. Extract direct watch links anywhere in HTML (inside script or attributes)
+                # Extract direct watch links from HTML
                 link_matches = re.findall(r'/(?:[a-z]{2}/)?shows/[^/"\s]+/\d+/([^/"\s]+)/(\d+)/watch', html)
                 for ep_slug, ep_id in link_matches:
                     if ep_id not in seen_ids:
@@ -156,7 +202,6 @@ class HotstarPlatform:
                             "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch"
                         })
 
-                # 3. Extract numeric watch links
                 num_matches = re.findall(r'/(\d{8,12})/watch', html)
                 for ep_id in num_matches:
                     if ep_id not in seen_ids:
@@ -168,27 +213,20 @@ class HotstarPlatform:
                         })
 
                 if entries:
-                    print(f"[✓] Strategy 1 (Webpage): Extracted {len(entries)} episodes from {show_slug}")
                     return entries
-            else:
-                print(f"[!] Hotstar webpage returned HTTP {resp.status_code}")
         except Exception as e:
-            print(f"[!] Strategy 1 error: {e}")
+            print(f"[!] Hotstar scraper error: {e}")
 
-        # ================= STRATEGY 2: Hotstar Content API =================
+        # Strategy 2: API Gateway
         if show_id:
             try:
                 api_url = f"https://api.hotstar.com/o/v1/multi/get/content?ids={show_id}"
-                api_headers = {**headers, "Accept": "application/json"}
-                resp = cls._make_http_get(api_url, api_headers)
+                resp = cls._make_http_get(api_url, {**headers, "Accept": "application/json"})
                 if resp.status_code == 200:
                     api_data = resp.json()
-                    # Parse contents
-                    items = []
-                    if isinstance(api_data, dict):
-                        response_body = api_data.get("body", {}) or api_data
-                        results = response_body.get("results", {}) or response_body
-                        items = results.get("items", []) or results.get("map", {}).values()
+                    response_body = api_data.get("body", {}) or api_data
+                    results = response_body.get("results", {}) or response_body
+                    items = results.get("items", []) or results.get("map", {}).values()
 
                     for item in items:
                         if isinstance(item, dict):
@@ -204,12 +242,11 @@ class HotstarPlatform:
                                     "url": f"https://www.hotstar.com/{c_id}/watch"
                                 })
                     if entries:
-                        print(f"[✓] Strategy 2 (API): Extracted {len(entries)} episodes for {show_slug}")
                         return entries
             except Exception as e:
-                print(f"[!] Strategy 2 error: {e}")
+                print(f"[!] Hotstar API error: {e}")
 
-        # ================= STRATEGY 3: yt-dlp Fallback =================
+        # Strategy 3: yt-dlp
         ydl_opts = {
             "extract_flat": "in_playlist",
             "skip_download": True,
@@ -220,10 +257,7 @@ class HotstarPlatform:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(clean_url, download=False)
-                res = info.get("entries", []) if info else []
-                if res:
-                    print(f"[✓] Strategy 3 (yt-dlp): Extracted {len(res)} episodes for {show_slug}")
-                return res
+                return info.get("entries", []) if info else []
             except Exception as e:
-                print(f"[!] Strategy 3 error: {e}")
+                print(f"[!] yt-dlp error: {e}")
                 return []
