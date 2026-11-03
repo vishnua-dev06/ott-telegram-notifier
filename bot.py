@@ -19,13 +19,15 @@ load_dotenv()
 
 # ======================= CONFIGURATION =======================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DATABASE_URI = os.getenv("DATABASE_URI", "").strip()
+DATABASE_NAME = os.getenv("DATABASE_NAME", "ott_notifier_db").strip()
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))
-DATA_FILE = os.getenv("DATA_FILE", "shows_data.json")
 PORT = int(os.getenv("PORT", "8080"))
+DATA_FILE = "shows_data.json"
 # ==============================================================
 
 
-# ------------------ DUMMY HTTP SERVER FOR KOYEB / CLOUD HEALTH CHECKS ------------------
+# ------------------ DUMMY HTTP SERVER (KOYEB HEALTH CHECKS) ------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Responds to cloud platform health checks (Koyeb, Render, etc.)."""
     def do_GET(self):
@@ -35,7 +37,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK - Hotstar Telegram Notifier is running!")
 
     def log_message(self, format, *args):
-        # Silence access logs to keep output clean
+        # Silence HTTP access logs to keep terminal clean
         return
 
 
@@ -48,10 +50,28 @@ def start_health_server():
         print(f"[!] Health check server warning: {e}")
 
 
+# ------------------ DATABASE LAYER (MONGODB & FALLBACK) ------------------
+mongo_client = None
+shows_col = None
 
-# ------------------ DATA PERSISTENCE ------------------
-def load_db() -> dict:
-    """Load shows and subscriber database."""
+if DATABASE_URI:
+    try:
+        from pymongo import MongoClient
+        mongo_client = MongoClient(DATABASE_URI, serverSelectionTimeoutMS=5000)
+        # Test connection
+        mongo_client.admin.command("ping")
+        db_instance = mongo_client[DATABASE_NAME]
+        shows_col = db_instance["shows"]
+        print(f"[✓] Connected to MongoDB Atlas! Using database: '{DATABASE_NAME}'")
+    except Exception as e:
+        print(f"[!] MongoDB connection failed ({e}). Falling back to local '{DATA_FILE}'.")
+        mongo_client = None
+        shows_col = None
+else:
+    print(f"[*] No DATABASE_URI provided. Using local file storage ('{DATA_FILE}').")
+
+
+def load_local_db() -> dict:
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -61,10 +81,122 @@ def load_db() -> dict:
     return {"shows": {}}
 
 
-def save_db(data: dict):
-    """Save database to disk."""
+def save_local_db(data: dict):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def db_get_all_shows() -> dict:
+    """Return dictionary of all tracked shows keyed by show_id."""
+    if shows_col is not None:
+        try:
+            docs = list(shows_col.find({}))
+            return {doc["show_id"]: doc for doc in docs}
+        except Exception as e:
+            print(f"[!] MongoDB read error: {e}")
+    return load_local_db().get("shows", {})
+
+
+def db_get_show(show_id: str) -> dict | None:
+    """Retrieve single show document."""
+    if shows_col is not None:
+        try:
+            return shows_col.find_one({"show_id": show_id})
+        except Exception as e:
+            print(f"[!] MongoDB find error: {e}")
+    return load_local_db().get("shows", {}).get(show_id)
+
+
+def db_save_new_show(show_data: dict):
+    """Save or update full show document."""
+    show_id = show_data["show_id"]
+    if shows_col is not None:
+        try:
+            shows_col.update_one({"show_id": show_id}, {"$set": show_data}, upsert=True)
+            return
+        except Exception as e:
+            print(f"[!] MongoDB save error: {e}")
+
+    # Fallback to local file
+    data = load_local_db()
+    data.setdefault("shows", {})[show_id] = show_data
+    save_local_db(data)
+
+
+def db_add_subscriber(show_id: str, chat_id: int):
+    """Add a chat_id to the subscribers list of a show."""
+    if shows_col is not None:
+        try:
+            shows_col.update_one({"show_id": show_id}, {"$addToSet": {"subscribers": chat_id}})
+            return
+        except Exception as e:
+            print(f"[!] MongoDB subscriber add error: {e}")
+
+    data = load_local_db()
+    shows = data.setdefault("shows", {})
+    if show_id in shows:
+        subs = shows[show_id].setdefault("subscribers", [])
+        if chat_id not in subs:
+            subs.append(chat_id)
+            save_local_db(data)
+
+
+def db_remove_subscriber(show_id: str, chat_id: int) -> str | None:
+    """Remove chat_id from a show's subscribers. Delete show if no subscribers left."""
+    if shows_col is not None:
+        try:
+            doc = shows_col.find_one({"show_id": show_id})
+            if not doc:
+                return None
+            serial_name = doc.get("serial_name", "Show")
+            shows_col.update_one({"show_id": show_id}, {"$pull": {"subscribers": chat_id}})
+            # Check if empty
+            updated = shows_col.find_one({"show_id": show_id})
+            if updated and not updated.get("subscribers"):
+                shows_col.delete_one({"show_id": show_id})
+            return serial_name
+        except Exception as e:
+            print(f"[!] MongoDB remove subscriber error: {e}")
+
+    data = load_local_db()
+    shows = data.get("shows", {})
+    if show_id in shows and chat_id in shows[show_id].get("subscribers", []):
+        serial_name = shows[show_id].get("serial_name", "Show")
+        shows[show_id]["subscribers"].remove(chat_id)
+        if not shows[show_id]["subscribers"]:
+            del shows[show_id]
+        save_local_db(data)
+        return serial_name
+    return None
+
+
+def db_add_seen_episode(show_id: str, ep_id: str):
+    """Mark an episode ID as seen."""
+    if shows_col is not None:
+        try:
+            shows_col.update_one({"show_id": show_id}, {"$addToSet": {"seen_episode_ids": ep_id}})
+            return
+        except Exception as e:
+            print(f"[!] MongoDB add seen error: {e}")
+
+    data = load_local_db()
+    shows = data.get("shows", {})
+    if show_id in shows:
+        seen = set(shows[show_id].get("seen_episode_ids", []))
+        seen.add(ep_id)
+        shows[show_id]["seen_episode_ids"] = list(seen)
+        save_local_db(data)
+
+
+def db_get_user_shows(chat_id: int) -> list[dict]:
+    """Retrieve all shows subscribed to by a particular chat_id."""
+    if shows_col is not None:
+        try:
+            return list(shows_col.find({"subscribers": chat_id}))
+        except Exception as e:
+            print(f"[!] MongoDB user shows error: {e}")
+    shows = load_local_db().get("shows", {})
+    return [s for s in shows.values() if chat_id in s.get("subscribers", [])]
 
 
 # ------------------ HELPERS & PARSING ------------------
@@ -147,6 +279,7 @@ def fetch_episodes_sync(show_url: str) -> list[dict]:
 # ------------------ TELEGRAM COMMAND HANDLERS ------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /start."""
+    db_mode = f"MongoDB Atlas ({DATABASE_NAME})" if shows_col is not None else "Local Storage"
     welcome_text = (
         "👋 <b>Welcome to the JioHotstar Episode Notification Bot!</b>\n\n"
         "I monitor your chosen serials on JioHotstar and notify you the moment a new episode is released.\n\n"
@@ -156,7 +289,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "➖ <code>/removeshow &lt;id_or_name&gt;</code> - Stop tracking a show\n"
         "<i>Example:</i> <code>/removeshow 1260141539</code>\n\n"
         "📋 <code>/listshows</code> - View shows tracked for this chat\n"
-        "⚡ <code>/test</code> - Preview the notification format"
+        "⚡ <code>/test</code> - Preview the notification format\n\n"
+        f"💾 <b>Storage:</b> <code>{db_mode}</code>"
     )
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
@@ -186,13 +320,11 @@ async def cmd_addshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"⏳ Inspecting <b>{serial_name}</b> and caching existing episodes...", parse_mode="HTML")
 
     entries = await asyncio.to_thread(fetch_episodes_sync, url)
+    existing_show = db_get_show(show_id)
 
-    db = load_db()
-    shows = db.setdefault("shows", {})
-
-    if show_id not in shows:
+    if not existing_show:
         seen_ids = [str(e.get("id")) for e in entries if e and e.get("id")]
-        shows[show_id] = {
+        show_data = {
             "show_id": show_id,
             "show_slug": show_slug,
             "serial_name": serial_name,
@@ -202,13 +334,11 @@ async def cmd_addshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "subscribers": [chat_id],
             "seen_episode_ids": seen_ids,
         }
+        db_save_new_show(show_data)
         cached_count = len(seen_ids)
     else:
-        if chat_id not in shows[show_id]["subscribers"]:
-            shows[show_id]["subscribers"].append(chat_id)
-        cached_count = len(shows[show_id].get("seen_episode_ids", []))
-
-    save_db(db)
+        db_add_subscriber(show_id, chat_id)
+        cached_count = len(existing_show.get("seen_episode_ids", []))
 
     await status_msg.edit_text(
         f"✅ <b>Now Tracking: {serial_name}</b>\n\n"
@@ -228,35 +358,26 @@ async def cmd_removeshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query = " ".join(context.args).lower().strip()
-    db = load_db()
-    shows = db.get("shows", {})
+    user_shows = db_get_user_shows(chat_id)
 
-    found_id = None
-    for s_id, s_info in shows.items():
-        if chat_id in s_info.get("subscribers", []):
-            if query == s_id or query == s_info.get("show_slug", "").lower() or query in s_info.get("serial_name", "").lower():
-                found_id = s_id
-                break
+    target_id = None
+    for s in user_shows:
+        if query == s["show_id"] or query == s.get("show_slug", "").lower() or query in s.get("serial_name", "").lower():
+            target_id = s["show_id"]
+            break
 
-    if not found_id:
+    if not target_id:
         await update.message.reply_text("❌ Show not found in your tracked list. Use <code>/listshows</code> to check.", parse_mode="HTML")
         return
 
-    serial_name = shows[found_id]["serial_name"]
-    shows[found_id]["subscribers"].remove(chat_id)
-
-    if not shows[found_id]["subscribers"]:
-        del shows[found_id]
-
-    save_db(db)
+    serial_name = db_remove_subscriber(target_id, chat_id)
     await update.message.reply_text(f"🗑️ <b>{serial_name}</b> has been removed from your tracking list.", parse_mode="HTML")
 
 
 async def cmd_listshows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for /listshows."""
     chat_id = update.effective_chat.id
-    db = load_db()
-    user_shows = [s for s in db.get("shows", {}).values() if chat_id in s.get("subscribers", [])]
+    user_shows = db_get_user_shows(chat_id)
 
     if not user_shows:
         await update.message.reply_text("ℹ️ You are not tracking any shows yet.\nUse <code>/addshow &lt;url&gt;</code> to start tracking!", parse_mode="HTML")
@@ -292,10 +413,9 @@ async def background_monitor(app: Application):
     """Periodically inspects all tracked shows and sends alerts to subscribers."""
     while True:
         try:
-            db = load_db()
-            shows = db.get("shows", {})
+            all_shows = db_get_all_shows()
 
-            for show_id, show in list(shows.items()):
+            for show_id, show in all_shows.items():
                 subscribers = show.get("subscribers", [])
                 if not subscribers:
                     continue
@@ -329,6 +449,7 @@ async def background_monitor(app: Application):
                         watch_link=watch_link
                     )
 
+                    # Send to all subscribers of this show
                     for chat_id in subscribers:
                         try:
                             await app.bot.send_message(
@@ -339,9 +460,9 @@ async def background_monitor(app: Application):
                         except Exception as send_err:
                             print(f"[!] Could not send to {chat_id}: {send_err}")
 
+                    # Mark as seen in database
+                    db_add_seen_episode(show_id, ep_id)
                     seen_ids.add(ep_id)
-                    show["seen_episode_ids"] = list(seen_ids)
-                    save_db(db)
                     print(f"[✓] Broadcasted new episode of {show['serial_name']}: Ep {ep_num}")
 
         except Exception as e:
@@ -359,7 +480,7 @@ async def post_init(application: Application):
 def main():
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         print("[!] ERROR: TELEGRAM_BOT_TOKEN is not set.")
-        print("[!] Create a .env file with your token or set TELEGRAM_BOT_TOKEN in your environment.")
+        print("[!] Create a .env file with your token or export TELEGRAM_BOT_TOKEN in your environment.")
         return
 
     # Start dummy HTTP health check server for Koyeb / Web Service health checks
@@ -379,4 +500,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
