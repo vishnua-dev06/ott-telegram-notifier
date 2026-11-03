@@ -29,9 +29,13 @@ def get_platform_handler(platform_name: str):
 
 def parse_show_url(url: str) -> tuple[str, str, str, str, str] | None:
     """
-    Auto-detects platform and converts ANY link (even watch links) into:
+    Auto-detects platform and converts ANY link (even watch links or links without https) into:
     (show_slug, show_id, serial_name, platform_name, canonical_url)
     """
+    url = url.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
     for p in PLATFORMS:
         if p.can_handle(url):
             res = p.parse_url(url)

@@ -214,7 +214,10 @@ async def cmd_addshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    url = args[0]
+    url = args[0].strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
     language = args[1] if len(args) > 1 else "Malayalam"
 
     parsed = parse_show_url(url)
@@ -690,6 +693,7 @@ def main():
 
     # Core Show Commands
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("addshow", cmd_addshow))
     app.add_handler(CommandHandler("removeshow", cmd_removeshow))
     app.add_handler(CommandHandler("listshows", cmd_listshows))
