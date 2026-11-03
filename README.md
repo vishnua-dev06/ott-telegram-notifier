@@ -1,6 +1,6 @@
 # Multi-OTT Episode Notification & Lookup Telegram Bot ⚡
 
-An automated Telegram bot that monitors and tracks your favorite TV serials and shows across **JioHotstar**, **Zee5**, **SonyLIV**, **SunNXT**, and **ManoramaMAX**. Features instant release alerts, on-demand episode lookups, poster banners, direct watch buttons, and full admin broadcast controls.
+An automated, modular Telegram bot that monitors and tracks TV serials and shows across **JioHotstar**, **Zee5**, **SonyLIV**, **SunNXT**, and **ManoramaMAX**. Features instant release alerts, on-demand episode lookups, poster banners, direct watch buttons, and full admin broadcast controls.
 
 ---
 
@@ -14,8 +14,32 @@ An automated Telegram bot that monitors and tracks your favorite TV serials and 
 
 ---
 
+## 📂 Modular Architecture
+
+```text
+ott-telegram-notifier/
+│
+├── platforms/
+│   ├── __init__.py          # Unified router: auto-detects platform and delegates
+│   ├── base.py              # Common helpers (slugify, title parsing, headers)
+│   ├── hotstar.py           # JioHotstar Next.js scraper & URL builder
+│   ├── zee5.py              # Zee5 scraper & URL builder
+│   ├── sonyliv.py           # SonyLIV scraper & URL builder
+│   ├── sunnxt.py            # SunNXT scraper & URL builder
+│   └── manoramamax.py       # ManoramaMAX scraper & URL builder
+│
+├── database.py              # MongoDB Atlas & Local JSON persistence layer
+├── bot.py                   # Telegram bot commands & background scheduler
+├── requirements.txt         # Dependencies
+├── Dockerfile               # Container build
+└── README.md                # Documentation
+```
+
+---
+
 ## 🚀 Key Features
 
+- **Modular Platform Structure**: Each OTT service lives in its own dedicated file under `platforms/` for easy upgrades and isolated debugging.
 - **🔍 On-Demand Episode Lookup (`/getepisode` / `/find`)**: Search and retrieve any past or latest episode link with full poster banner on demand.
 - **📢 Admin Broadcast (`/broadcast`)**: Send announcements to all bot subscribers and channels with one command.
 - **🖼️ Episode Thumbnail Banners**: High-definition poster images automatically delivered with captions.
@@ -26,29 +50,6 @@ An automated Telegram bot that monitors and tracks your favorite TV serials and 
 - **💾 MongoDB Atlas Persistence**: Stores all shows, subscribers, and released episode IDs forever (`DATABASE_URI` and `DATABASE_NAME`).
 - **Anti-Spam Deduplication**: Automatically pre-caches existing episodes so old ones aren't spammed.
 - **Koyeb & Cloud Compatible**: Built-in HTTP health check server on port 8080.
-
----
-
-## 📱 Notification Preview
-
-```text
-[ 🖼️ Episode Banner Image ]
-
-⚡ #First_On_Hotstar
-
-Serial Name: Patharamattu
-Episode Name: Nandana Arrives to Arrest Abhi
-Episode Number: 1116
-Season Number: 1
-From OTT: Hotstar
-Language: Malayalam
-Release Date: 03 Nov, 2026
-Release Day: Tuesday
-
-Link: https://www.hotstar.com/in/shows/patharamattu/1260141539/nandana-arrives-to-arrest-abhi/1641039866/watch
-
-[ 🎬 Watch on JioHotstar ]   [ ↗️ Share Episode ]
-```
 
 ---
 
