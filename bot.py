@@ -644,10 +644,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------ TELEGRAM ERROR HANDLER ------------------
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(context.error, telegram.error.Conflict):
-        print("\n[⚠️ CONFLICT ERROR] Another instance of this bot is polling getUpdates!")
-        print("[⚠️ CONFLICT ERROR] 1. Stop 'python bot.py' if running locally on your PC.")
-        print("[⚠️ CONFLICT ERROR] 2. In Koyeb, verify Instance Count is set to 1.\n")
-        await asyncio.sleep(5)
+        print("[ℹ️ Telegram Transition] Deployment instance switchover in progress. Waiting for previous container to retire...")
+        await asyncio.sleep(8)
     elif isinstance(context.error, telegram.error.NetworkError):
         print(f"[!] Telegram network warning: {context.error}")
         await asyncio.sleep(3)
@@ -724,13 +722,26 @@ async def check_and_broadcast_episodes(app: Application) -> int:
 
 
 async def background_monitor(app: Application):
-    while True:
-        await check_and_broadcast_episodes(app)
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+    try:
+        while True:
+            await check_and_broadcast_episodes(app)
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        print("[*] Background monitor stopped cleanly.")
 
 
 async def post_init(application: Application):
-    asyncio.create_task(background_monitor(application))
+    application.bot_data["monitor_task"] = asyncio.create_task(background_monitor(application))
+
+
+async def post_shutdown(application: Application):
+    task = application.bot_data.get("monitor_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 # ------------------ MAIN ENTRYPOINT ------------------
@@ -743,7 +754,13 @@ def main():
     threading.Thread(target=start_health_server, daemon=True).start()
 
     print("[*] Starting Modular Multi-OTT Telegram Bot...")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_error_handler(global_error_handler)
 

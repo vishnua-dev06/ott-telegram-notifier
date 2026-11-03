@@ -206,18 +206,38 @@ class HotstarPlatform:
             except Exception as e:
                 print(f"[!] Hotstar API error: {e}")
 
-        # Strategy 3: yt-dlp
+        # Strategy 3: yt-dlp (silently handles datacenter IP 475 restrictions)
+        class QuietYtdlLogger:
+            def debug(self, msg): pass
+            def warning(self, msg): pass
+            def error(self, msg): pass
+
         ydl_opts = {
             "extract_flat": "in_playlist",
             "skip_download": True,
             "quiet": True,
             "no_warnings": True,
+            "logger": QuietYtdlLogger(),
             "http_headers": headers
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(clean_url, download=False)
-                return info.get("entries", []) if info else []
-            except Exception as e:
-                print(f"[!] yt-dlp error: {e}")
-                return []
+                res = info.get("entries", []) if info else []
+                if res:
+                    return res
+            except Exception:
+                pass
+
+        # Strategy 4: Multi-Engine Web Search Index Crawler (DuckDuckGo Lite + Bing + Yahoo)
+        # Bypasses cloud datacenter IP blocks, Akamai restrictions, and foreign IP 475 errors
+        try:
+            from platforms.web_search import search_all_episodes_from_internet
+            show_name = show_slug.replace("-", " ").title()
+            online_episodes = search_all_episodes_from_internet(show_name, show_slug, show_id, "Hotstar")
+            if online_episodes:
+                return online_episodes
+        except Exception as e:
+            print(f"[!] Hotstar online episode discovery warning: {e}")
+
+        return []
