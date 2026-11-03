@@ -367,9 +367,17 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text(f"🔍 Searching episodes for <b>{matched_show['serial_name']}</b>...", parse_mode="HTML")
 
     from_ott = matched_show.get("from_ott", "Hotstar")
-    episodes = matched_show.get("cached_episodes") or []
+    raw_cached = matched_show.get("cached_episodes") or []
+    # Filter out any corrupt or dummy entries from previous versions
+    episodes = [
+        e for e in raw_cached
+        if e and isinstance(e, dict)
+        and str(e.get("id", "")).isdigit()
+        and len(str(e.get("id", ""))) >= 8
+        and str(e.get("id", "")) != str(matched_show["show_id"])
+    ]
 
-    # If cache is empty, attempt a fresh scrape
+    # If valid cache is empty, attempt a fresh scrape
     if not episodes:
         episodes = await asyncio.to_thread(fetch_episodes, matched_show["url"], from_ott)
         if episodes:
@@ -392,22 +400,28 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             target_ep = episodes[0]
 
-    # Query search engine index if not found in cache/live scrape
-    if not target_ep and ep_num_query:
-        online_match = await asyncio.to_thread(
-            search_episode_online,
-            matched_show["serial_name"],
-            matched_show["show_slug"],
-            matched_show["show_id"],
-            ep_num_query,
-            from_ott
-        )
-        if online_match and online_match.get("id"):
-            target_ep = online_match
-            # Cache it so future lookups are instant
-            cached = matched_show.get("cached_episodes") or []
-            cached.insert(0, target_ep)
-            db.db_update_cached_episodes(matched_show["show_id"], cached)
+    # Query search engine index or refresh catalog if not found in cache
+    if not target_ep:
+        if ep_num_query:
+            online_match = await asyncio.to_thread(
+                search_episode_online,
+                matched_show["serial_name"],
+                matched_show["show_slug"],
+                matched_show["show_id"],
+                ep_num_query,
+                from_ott
+            )
+            if online_match and online_match.get("id") and str(online_match.get("id")) != str(matched_show["show_id"]):
+                target_ep = online_match
+                # Cache it so future lookups are instant
+                cached = matched_show.get("cached_episodes") or []
+                cached.insert(0, target_ep)
+                db.db_update_cached_episodes(matched_show["show_id"], cached)
+        else:
+            fresh = await asyncio.to_thread(fetch_episodes, matched_show["url"], from_ott)
+            if fresh:
+                target_ep = fresh[0]
+                db.db_update_cached_episodes(matched_show["show_id"], fresh)
 
     # Fallback if specific episode wasn't found in list or scraper was throttled
     exact_link_missing = False
@@ -440,9 +454,13 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     raw_title = target_ep.get("title", "Episode")
     ep_num, ep_name = parse_episode_details(raw_title)
+    if target_ep.get("episode_number"):
+        ep_num = str(target_ep["episode_number"])
+    if target_ep.get("episode_name") and target_ep["episode_name"] != "Episode":
+        ep_name = str(target_ep["episode_name"])
     if ep_num_query and (not ep_num or ep_num == "Latest"):
         ep_num = ep_num_query
-        if ep_name == "Episode" or ep_name == "Latest Episode":
+        if ep_name in ("Episode", "Latest Episode"):
             ep_name = f"Episode {ep_num_query}"
 
     season_num = str(target_ep.get("season_number") or "1")

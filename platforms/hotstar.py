@@ -1,6 +1,7 @@
 import re
 import json
 import urllib.parse
+import concurrent.futures
 import requests
 import yt_dlp
 from platforms.base import slugify, COMMON_HEADERS, HOTSTAR_EP_RE, has_episode_number, episode_sort_key
@@ -96,11 +97,104 @@ class HotstarPlatform:
         return requests.get(url, headers=headers, timeout=15)
 
     @classmethod
+    def _fetch_from_sitemaps(cls, show_slug: str, show_id: str) -> list[dict]:
+        """
+        Discovers official Hotstar episode URLs directly from Hotstar's public XML sitemaps
+        and enriches them with genuine episode metadata (titles, episode numbers, etc.)
+        via the Hotstar catalog multi-content API. Bypasses all cloud IP restrictions.
+        """
+        sitemap_urls = [f"https://www.hotstar.com/in/new-sitemap-EPISODE-{i}.xml" for i in range(1, 10)]
+        slug_map = {}
+        pattern = rf'shows/{re.escape(show_slug)}/{re.escape(str(show_id))}/([^/"\s]+)/(\d{{8,12}})/watch'
+
+        def fetch_sitemap(url):
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code == 200:
+                    return re.findall(pattern, r.text)
+            except Exception:
+                pass
+            return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=9) as ex:
+            for res in ex.map(fetch_sitemap, sitemap_urls):
+                for ep_slug, ep_id in res:
+                    if ep_id != str(show_id):
+                        slug_map[ep_id] = ep_slug
+
+        if not slug_map:
+            return []
+
+        # Sort IDs prioritizing recent 2026 content blocks (1641..., 1700...)
+        all_ids = list(slug_map.keys())
+        all_ids.sort(key=lambda x: (x.startswith("1641"), x.startswith("1700"), x), reverse=True)
+        target_ids = all_ids[:200]
+
+        headers = {
+            "x-country-code": "IN",
+            "x-platform-code": "JIO",
+            "User-Agent": "Hotstar;in.startv.hotstar/3.3.0 (Android/8.1.0)",
+            "Accept": "application/json",
+        }
+
+        episodes = []
+
+        def fetch_chunk(chunk):
+            chunk_eps = []
+            try:
+                api_url = f"https://api.hotstar.com/o/v1/multi/get/content?ids={','.join(chunk)}"
+                r = requests.get(api_url, headers=headers, timeout=10)
+                if r.status_code == 200:
+                    results_map = r.json().get("body", {}).get("results", {}).get("map", {})
+                    for c_id, item in results_map.items():
+                        if isinstance(item, dict):
+                            ep_no = str(item.get("episodeNo") or "")
+                            title = item.get("title") or f"Episode {ep_no}"
+                            season_no = str(item.get("seasonNo") or "1")
+                            ep_slug = slug_map.get(str(c_id)) or slugify(title) or "episode"
+                            watch_url = f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{c_id}/watch"
+                            thumb = None
+                            if isinstance(item.get("images"), dict):
+                                thumb = item["images"].get("h") or item["images"].get("v")
+                            elif isinstance(item.get("image"), str):
+                                thumb = item.get("image")
+
+                            chunk_eps.append({
+                                "id": str(c_id),
+                                "title": f"Episode {ep_no} - {title}" if ep_no and ep_no not in str(title) else str(title),
+                                "episode_name": title,
+                                "episode_number": ep_no,
+                                "season_number": season_no,
+                                "thumbnail": thumb,
+                                "url": watch_url,
+                            })
+            except Exception:
+                pass
+            return chunk_eps
+
+        chunks = [target_ids[i:i + 40] for i in range(0, len(target_ids), 40)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            for chunk_eps in ex.map(fetch_chunk, chunks):
+                episodes.extend(chunk_eps)
+
+        if episodes:
+            return sorted(episodes, key=episode_sort_key, reverse=True)
+        return []
+
+    @classmethod
     def search_episode_online(cls, show_slug: str, show_id: str, ep_number: str) -> dict | None:
         """
-        Uses multi-engine search indexing to find the real Hotstar episode title and 10-digit watch URL.
-        Bypasses datacenter IP blocks and geo-restrictions.
+        Finds the exact Hotstar episode title and genuine 10-digit watch URL.
+        1. Checks the official Hotstar catalog and sitemaps.
+        2. Falls back to multi-engine public internet search.
         """
+        show_url = f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}"
+        episodes = cls.fetch_episodes(show_url)
+        for ep in episodes:
+            stored_num = str(ep.get("episode_number") or "")
+            if stored_num == str(ep_number) or has_episode_number(ep.get("title", ""), ep_number):
+                return ep
+
         from platforms.web_search import search_exact_episode_from_internet
         show_name = show_slug.replace("-", " ").title()
         return search_exact_episode_from_internet(show_name, show_slug, show_id, ep_number, "Hotstar")
@@ -115,6 +209,15 @@ class HotstarPlatform:
         show_slug = parsed[0] if parsed else "show"
         show_id = parsed[1] if parsed else ""
 
+        # Strategy 1: Official Sitemaps + Multi-Get Content Metadata (Direct, accurate, bypasses all geo-blocks)
+        if show_slug and show_id:
+            try:
+                sitemap_episodes = cls._fetch_from_sitemaps(show_slug, show_id)
+                if sitemap_episodes:
+                    return sitemap_episodes
+            except Exception as e:
+                print(f"[!] Hotstar sitemap discovery warning: {e}")
+
         headers = {
             **COMMON_HEADERS,
             "Referer": "https://www.hotstar.com/",
@@ -125,7 +228,7 @@ class HotstarPlatform:
         entries = []
         seen_ids = set()
 
-        # Strategy 1: Webpage Scrape
+        # Strategy 2: Webpage Scrape
         try:
             resp = cls._make_http_get(clean_url, headers)
             if resp.status_code == 200:
