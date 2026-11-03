@@ -31,12 +31,21 @@ from platforms import (
 )
 from platforms.base import parse_episode_details, extract_thumbnail_url
 
+# ======================= TIMEZONE CONFIGURATION =======================
+# Indian Standard Time (IST) ensures exact release date & day on foreign cloud servers (Koyeb, Render, AWS)
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    from datetime import timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+
 # ======================= CONFIGURATION =======================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))
 PORT = int(os.getenv("PORT", "8080"))
-BOT_START_TIME = datetime.now()
+BOT_START_TIME = datetime.now(IST)
 # ==============================================================
 
 
@@ -64,7 +73,7 @@ def start_health_server():
 
 # ------------------ PRESENTATION & NOTIFICATIONS ------------------
 def get_uptime() -> str:
-    delta = datetime.now() - BOT_START_TIME
+    delta = datetime.now(IST) - BOT_START_TIME
     days = delta.days
     hours, rem = divmod(delta.seconds, 3600)
     minutes, seconds = divmod(rem, 60)
@@ -80,7 +89,7 @@ def get_uptime() -> str:
 def format_notification(serial_name: str, ep_name: str, ep_number: str,
                         season_number: str, language: str, from_ott: str,
                         watch_link: str, dt: datetime = None) -> str:
-    now = dt or datetime.now()
+    now = dt or datetime.now(IST)
     release_date = now.strftime("%d %b, %Y")
     release_day = now.strftime("%A")
 
@@ -485,6 +494,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     stats_text = (
         "📊 <b>Bot Statistics & Status</b>\n\n"
+        f"🕒 <b>Current IST:</b> {datetime.now(IST).strftime('%d %b %Y, %I:%M %p')}\n"
         f"⏱️ <b>Uptime:</b> {uptime_str}\n"
         f"💾 <b>Database:</b> {storage_type}\n"
         f"📺 <b>Tracked Shows:</b> {total_shows} ({platform_summary})\n"

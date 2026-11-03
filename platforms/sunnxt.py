@@ -43,3 +43,4 @@ class SunNXTPlatform:
             except Exception as e:
                 print(f"[!] SunNXT extractor error: {e}")
                 return []
+

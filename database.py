@@ -248,3 +248,4 @@ def is_authorized(user_id: int) -> bool:
     if is_admin(user_id):
         return True
     return user_id in db_get_authorized_users()
+

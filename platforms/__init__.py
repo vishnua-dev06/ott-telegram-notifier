@@ -65,3 +65,4 @@ def build_watch_link(show_slug: str, show_id: str, ep_name: str, ep_id: str, pla
 def get_supported_platforms() -> list[str]:
     """Returns list of all supported OTT platforms."""
     return [p.NAME for p in PLATFORMS]
+

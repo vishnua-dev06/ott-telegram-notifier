@@ -43,3 +43,4 @@ class ManoramaMAXPlatform:
             except Exception as e:
                 print(f"[!] ManoramaMAX extractor error: {e}")
                 return []
+

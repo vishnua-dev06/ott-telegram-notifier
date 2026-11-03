@@ -118,3 +118,4 @@ class HotstarPlatform:
             except Exception as e:
                 print(f"[!] yt-dlp Hotstar fallback error: {e}")
                 return []
+

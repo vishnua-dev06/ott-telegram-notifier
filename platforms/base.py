@@ -45,3 +45,4 @@ def extract_thumbnail_url(ep_entry: dict) -> str | None:
         return poster
 
     return None
+
