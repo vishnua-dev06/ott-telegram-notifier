@@ -108,17 +108,23 @@ def format_notification(serial_name: str, ep_name: str, ep_number: str,
     )
 
 
-def build_inline_keyboard(watch_link: str, from_ott: str = "Hotstar") -> InlineKeyboardMarkup:
-    button_label = f"🎬 Watch on {from_ott}"
+def build_inline_keyboard(watch_link: str, from_ott: str = "Hotstar", ep_title: str = None) -> InlineKeyboardMarkup:
+    is_direct_watch = "/watch" in watch_link
+    button_label = f"▶️ Watch on {from_ott}" if is_direct_watch else f"📺 Watch Latest on {from_ott}"
     keyboard = [
         [InlineKeyboardButton(button_label, url=watch_link)],
-        [InlineKeyboardButton("↗️ Share Episode", url=f"https://t.me/share/url?url={watch_link}&text=New%20Episode%20Released!")]
     ]
+    if not is_direct_watch and ep_title:
+        search_query = f"{from_ott} {ep_title} watch online"
+        search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_query)}"
+        keyboard.append([InlineKeyboardButton("🔍 Search Episode Online", url=search_url)])
+
+    keyboard.append([InlineKeyboardButton("↗️ Share Episode", url=f"https://t.me/share/url?url={watch_link}&text=New%20Episode%20Released!")])
     return InlineKeyboardMarkup(keyboard)
 
 
-async def send_episode_alert(bot, chat_id: int, alert_text: str, watch_link: str, from_ott: str = "Hotstar", thumbnail_url: str = None) -> bool:
-    reply_markup = build_inline_keyboard(watch_link, from_ott=from_ott)
+async def send_episode_alert(bot, chat_id: int, alert_text: str, watch_link: str, from_ott: str = "Hotstar", thumbnail_url: str = None, ep_title: str = None) -> bool:
+    reply_markup = build_inline_keyboard(watch_link, from_ott=from_ott, ep_title=ep_title)
 
     if thumbnail_url:
         try:
@@ -389,6 +395,7 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not target_ep and ep_num_query:
         online_match = await asyncio.to_thread(
             search_episode_online,
+            matched_show["serial_name"],
             matched_show["show_slug"],
             matched_show["show_id"],
             ep_num_query,
@@ -464,7 +471,8 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert_text=alert_text,
         watch_link=watch_link,
         from_ott=from_ott,
-        thumbnail_url=thumbnail_url
+        thumbnail_url=thumbnail_url,
+        ep_title=f"{matched_show['serial_name']} {ep_name}"
     )
 
 

@@ -4,6 +4,7 @@ from platforms.zee5 import Zee5Platform
 from platforms.sonyliv import SonyLIVPlatform
 from platforms.sunnxt import SunNXTPlatform
 from platforms.manoramamax import ManoramaMAXPlatform
+from platforms.web_search import search_exact_episode_from_internet, search_all_episodes_from_internet
 
 PLATFORMS = [
     HotstarPlatform,
@@ -78,11 +79,15 @@ def build_watch_link(show_slug: str, show_id: str, ep_name: str, ep_id: str, pla
     return handler.build_watch_link(show_slug, show_id, ep_name, ep_id, raw_url=raw_url)
 
 
-def search_episode_online(show_slug: str, show_id: str, ep_number: str, platform_name: str) -> dict | None:
+def search_episode_online(show_name: str, show_slug: str, show_id: str, ep_number: str, platform_name: str) -> dict | None:
+    # 1. First try platform-specific online search if available
     handler = get_platform_handler(platform_name)
     if hasattr(handler, "search_episode_online"):
-        return handler.search_episode_online(show_slug, show_id, ep_number)
-    return None
+        res = handler.search_episode_online(show_slug, show_id, ep_number)
+        if res:
+            return res
+    # 2. Multi-engine search across public internet indexes (DDG Lite, Bing, Yahoo)
+    return search_exact_episode_from_internet(show_name, show_slug, show_id, ep_number, platform_name)
 
 
 def get_supported_platforms() -> list[str]:

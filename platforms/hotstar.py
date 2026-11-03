@@ -72,52 +72,12 @@ class HotstarPlatform:
     @classmethod
     def search_episode_online(cls, show_slug: str, show_id: str, ep_number: str) -> dict | None:
         """
-        Uses search engine indexing to find the real Hotstar episode title and 10-digit watch URL.
+        Uses multi-engine search indexing to find the real Hotstar episode title and 10-digit watch URL.
         Bypasses datacenter IP blocks and geo-restrictions.
         """
-        queries = [
-            f"site:hotstar.com/in/shows/{show_slug} \"{ep_number}\"",
-            f"site:hotstar.com/in/shows/{show_slug} \"Episode {ep_number}\"",
-            f"site:hotstar.com/in/shows/{show_slug}/{show_id} \"{ep_number}\"",
-        ]
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-
-        for q in queries:
-            try:
-                url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
-                resp = requests.get(url, headers=headers, timeout=8)
-                if resp.status_code == 200:
-                    matches = re.findall(r'uddg=(https%3A%2F%2F(?:www\.)?hotstar\.com[^&"\']+)', resp.text)
-                    for m in matches:
-                        clean_link = urllib.parse.unquote(m).split("?")[0]
-                        match_watch = re.search(r'shows/[^/]+/\d+/([^/]+)/(\d{8,12})/watch', clean_link)
-                        if match_watch:
-                            ep_slug = match_watch.group(1)
-                            ep_id = match_watch.group(2)
-                            ep_name = ep_slug.replace("-", " ").title()
-                            return {
-                                "id": ep_id,
-                                "title": f"Episode {ep_number} - {ep_name}",
-                                "season_number": "1",
-                                "url": clean_link,
-                            }
-                        match_num = re.search(r'/(\d{8,12})/watch', clean_link)
-                        if match_num:
-                            ep_id = match_num.group(1)
-                            return {
-                                "id": ep_id,
-                                "title": f"Episode {ep_number}",
-                                "season_number": "1",
-                                "url": clean_link,
-                            }
-            except Exception as e:
-                print(f"[!] Online search error for query '{q}': {e}")
-
-        return None
+        from platforms.web_search import search_exact_episode_from_internet
+        show_name = show_slug.replace("-", " ").title()
+        return search_exact_episode_from_internet(show_name, show_slug, show_id, ep_number, "Hotstar")
 
     @classmethod
     def fetch_episodes(cls, show_url: str) -> list[dict]:
