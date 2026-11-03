@@ -1,5 +1,7 @@
 import os
+import re
 import asyncio
+import urllib.parse
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
@@ -30,7 +32,7 @@ from platforms import (
     search_episode_online,
     get_supported_platforms,
 )
-from platforms.base import parse_episode_details, extract_thumbnail_url
+from platforms.base import parse_episode_details, extract_thumbnail_url, has_episode_number
 
 # ======================= TIMEZONE CONFIGURATION =======================
 # Indian Standard Time (IST) ensures exact release date & day on foreign cloud servers (Koyeb, Render, AWS)
@@ -109,7 +111,7 @@ def format_notification(serial_name: str, ep_name: str, ep_number: str,
 
 
 def build_inline_keyboard(watch_link: str, from_ott: str = "Hotstar", ep_title: str = None) -> InlineKeyboardMarkup:
-    is_direct_watch = "/watch" in watch_link
+    is_direct_watch = watch_link.rstrip("/").endswith("/watch")
     button_label = f"▶️ Watch on {from_ott}" if is_direct_watch else f"📺 Watch Latest on {from_ott}"
     keyboard = [
         [InlineKeyboardButton(button_label, url=watch_link)],
@@ -119,7 +121,7 @@ def build_inline_keyboard(watch_link: str, from_ott: str = "Hotstar", ep_title: 
         search_url = f"https://www.google.com/search?q={urllib.parse.quote(search_query)}"
         keyboard.append([InlineKeyboardButton("🔍 Search Episode Online", url=search_url)])
 
-    keyboard.append([InlineKeyboardButton("↗️ Share Episode", url=f"https://t.me/share/url?url={watch_link}&text=New%20Episode%20Released!")])
+    keyboard.append([InlineKeyboardButton("↗️ Share Episode", url=f"https://t.me/share/url?url={urllib.parse.quote(watch_link, safe='')}&text={urllib.parse.quote('New Episode Released!')}")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -379,12 +381,11 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for ep in episodes:
                 raw_title = str(ep.get("title", ""))
                 ep_n, _ = parse_episode_details(raw_title)
+                stored_num = str(ep.get("episode_number") or "")
                 if (
-                    ep_n == ep_num_query
-                    or f"episode {ep_num_query}" in raw_title.lower()
-                    or f"ep {ep_num_query}" in raw_title.lower()
-                    or f"- {ep_num_query}" in raw_title
-                    or raw_title.endswith(f" {ep_num_query}")
+                    stored_num == ep_num_query
+                    or (ep_n == ep_num_query)
+                    or has_episode_number(re.sub(r"/\d{8,12}", "", raw_title), ep_num_query)
                 ):
                     target_ep = ep
                     break
@@ -409,7 +410,9 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.db_update_cached_episodes(matched_show["show_id"], cached)
 
     # Fallback if specific episode wasn't found in list or scraper was throttled
+    exact_link_missing = False
     if not target_ep:
+        exact_link_missing = True
         if ep_num_query:
             target_ep = {
                 "id": matched_show["show_id"],
@@ -464,6 +467,12 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_ott=from_ott,
         watch_link=watch_link
     )
+
+    if exact_link_missing or "/watch" not in watch_link:
+        alert_text += (
+            "\n\n⚠️ Exact episode link could not be found (not indexed / platform blocked this server). "
+            "The button opens the show page instead."
+        )
 
     await send_episode_alert(
         context.bot,
@@ -707,7 +716,8 @@ async def check_and_broadcast_episodes(app: Application) -> int:
                         alert_text=alert_text,
                         watch_link=watch_link,
                         from_ott=from_ott,
-                        thumbnail_url=thumbnail_url
+                        thumbnail_url=thumbnail_url,
+                        ep_title=f"{show['serial_name']} {ep_name}"
                     )
 
                 db.db_add_seen_episode(show_id, ep_id)

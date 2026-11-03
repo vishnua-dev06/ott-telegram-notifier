@@ -3,7 +3,7 @@ import json
 import urllib.parse
 import requests
 import yt_dlp
-from platforms.base import slugify, COMMON_HEADERS
+from platforms.base import slugify, COMMON_HEADERS, HOTSTAR_EP_RE, has_episode_number, episode_sort_key
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -44,21 +44,47 @@ class HotstarPlatform:
     @classmethod
     def build_watch_link(cls, show_slug: str, show_id: str, ep_name: str, ep_id: str, raw_url: str = None) -> str:
         """
-        Builds canonical watch URL.
-        Guarantees that if ep_id is not a real 8+ digit video asset, it links
-        safely to the show page instead of generating an invalid watch link.
+        Builds the canonical Hotstar episode URL:
+            https://www.hotstar.com/in/shows/<show-slug>/<show_id>/<episode-slug>/<episode_id>/watch
+
+        Rules (these fix the wrong-link bugs):
+        - A raw URL is only trusted if it belongs to THIS show (same show_id) and carries a
+          real 8-12 digit episode id. It is then re-emitted in canonical form.
+        - If we do not have a real episode id we fall back to the show page, never to a
+          made-up watch link.
         """
-        if raw_url and raw_url.startswith("http") and "/watch" in raw_url:
-            return raw_url
+        show_page = f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}"
 
-        # Prevent duplicate show_id in watch path (e.g. .../<show_id>/episode-1115/<show_id>/watch)
-        if not ep_id or ep_id == show_id or not ep_id.isdigit() or len(ep_id) < 8:
-            return f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}"
+        if raw_url:
+            m = HOTSTAR_EP_RE.search(raw_url)
+            if m and m.group(2) == str(show_id) and m.group(4) != str(show_id):
+                return f"https://www.hotstar.com/in/shows/{m.group(1)}/{m.group(2)}/{m.group(3)}/{m.group(4)}/watch"
 
-        ep_slug = slugify(ep_name)
-        if ep_slug and ep_slug not in ["episode", "latest-episode"]:
-            return f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch"
-        return f"https://www.hotstar.com/{ep_id}/watch"
+        ep_id = str(ep_id or "")
+        if not ep_id.isdigit() or len(ep_id) < 8 or ep_id == str(show_id):
+            return show_page
+
+        ep_slug = slugify(ep_name or "")
+        if not ep_slug or ep_slug in ("episode", "latest-episode", "new-episode"):
+            ep_slug = "episode"
+        return f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch"
+
+    @classmethod
+    def verify_episode_page(cls, watch_url: str, ep_number: str) -> bool | None:
+        """
+        Best-effort check that a watch URL really is the requested episode.
+        True = confirmed, False = page loaded but number not found, None = could not load page.
+        """
+        try:
+            resp = cls._make_http_get(watch_url, {**COMMON_HEADERS, "Referer": "https://www.hotstar.com/"})
+            if resp.status_code != 200:
+                return None
+            head = resp.text[:60000]
+            meta = re.findall(r"<title[^>]*>([\s\S]*?)</title>|property=\"og:title\" content=\"([^\"]*)\"", head)
+            blob = " ".join(a or b for a, b in meta) + " " + watch_url
+            return has_episode_number(blob, ep_number)
+        except Exception:
+            return None
 
     @classmethod
     def _make_http_get(cls, url: str, headers: dict):
@@ -111,20 +137,30 @@ class HotstarPlatform:
                     try:
                         data = json.loads(next_match.group(1))
 
+                        def belongs_to_show(obj: dict) -> bool:
+                            """Only accept episodes of THIS show (ignore recommendation/'More like this' rows)."""
+                            for key in ("showId", "showContentId", "showContentID", "show_id", "parentContentId"):
+                                if obj.get(key) is not None:
+                                    return str(obj[key]) == str(show_id)
+                            link_blob = " ".join(str(obj.get(k, "")) for k in ("url", "deeplink", "deepLink", "pageUrl", "path"))
+                            m = HOTSTAR_EP_RE.search(link_blob)
+                            if m:
+                                return m.group(2) == str(show_id)
+                            return False
+
                         def search_items(obj):
                             if isinstance(obj, dict):
                                 c_id = str(obj.get("contentId") or obj.get("id") or obj.get("content_id") or obj.get("assetId") or "")
                                 title = obj.get("title") or obj.get("episodeTitle") or obj.get("name")
-                                if c_id and c_id.isdigit() and len(c_id) >= 6 and title and c_id not in seen_ids:
+                                if c_id and c_id.isdigit() and 8 <= len(c_id) <= 12 and c_id != str(show_id) \
+                                        and title and c_id not in seen_ids:
                                     is_ep = (
                                         obj.get("episodeNo") is not None
                                         or obj.get("episodeNumber") is not None
-                                        or "watch" in str(obj.get("url", ""))
                                         or obj.get("assetType") in ["EPISODE", "SHOW_EPISODE"]
                                         or "episode" in str(obj.get("entityType", "")).lower()
-                                        or "/watch" in str(obj)
                                     )
-                                    if is_ep:
+                                    if is_ep and belongs_to_show(obj):
                                         seen_ids.add(c_id)
                                         ep_num = str(obj.get("episodeNo") or obj.get("episodeNumber") or "")
                                         thumb = None
@@ -133,12 +169,14 @@ class HotstarPlatform:
                                         elif isinstance(obj.get("image"), str):
                                             thumb = obj.get("image")
 
+                                        ep_slug = slugify(str(title)) or "episode"
                                         entries.append({
                                             "id": c_id,
                                             "title": f"Episode {ep_num} - {title}" if ep_num and ep_num not in str(title) else str(title),
+                                            "episode_number": ep_num,
                                             "thumbnail": thumb,
                                             "season_number": str(obj.get("seasonNo") or obj.get("seasonNumber") or "1"),
-                                            "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{c_id}/watch"
+                                            "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{c_id}/watch"
                                         })
                                 for v in obj.values():
                                     search_items(v)
@@ -150,10 +188,10 @@ class HotstarPlatform:
                     except Exception as json_err:
                         print(f"[!] Error reading Hotstar __NEXT_DATA__: {json_err}")
 
-                # Extract direct watch links from HTML
-                link_matches = re.findall(r'/(?:[a-z]{2}/)?shows/[^/"\s]+/\d+/([^/"\s]+)/(\d+)/watch', html)
-                for ep_slug, ep_id in link_matches:
-                    if ep_id not in seen_ids:
+                # Extract direct watch links from HTML - ONLY links under this show's id
+                link_pattern = rf'/(?:[a-z]{{2}}/)?shows/[^/"\s]+/{re.escape(str(show_id))}/([^/"\s]+)/(\d{{8,12}})/watch'
+                for ep_slug, ep_id in re.findall(link_pattern, html):
+                    if ep_id not in seen_ids and ep_id != str(show_id):
                         seen_ids.add(ep_id)
                         clean_title = ep_slug.replace("-", " ").title()
                         entries.append({
@@ -162,18 +200,8 @@ class HotstarPlatform:
                             "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch"
                         })
 
-                num_matches = re.findall(r'/(\d{8,12})/watch', html)
-                for ep_id in num_matches:
-                    if ep_id not in seen_ids:
-                        seen_ids.add(ep_id)
-                        entries.append({
-                            "id": ep_id,
-                            "title": f"Episode {ep_id}",
-                            "url": f"https://www.hotstar.com/{ep_id}/watch"
-                        })
-
                 if entries:
-                    return entries
+                    return sorted(entries, key=episode_sort_key, reverse=True)
         except Exception as e:
             print(f"[!] Hotstar scraper error: {e}")
 
@@ -199,10 +227,10 @@ class HotstarPlatform:
                                     "id": c_id,
                                     "title": f"Episode {ep_num} - {title}" if ep_num and ep_num not in str(title) else str(title),
                                     "season_number": str(item.get("seasonNo") or "1"),
-                                    "url": f"https://www.hotstar.com/{c_id}/watch"
+                                    "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{slugify(str(title)) or 'episode'}/{c_id}/watch"
                                 })
                     if entries:
-                        return entries
+                        return sorted(entries, key=episode_sort_key, reverse=True)
             except Exception as e:
                 print(f"[!] Hotstar API error: {e}")
 
@@ -236,7 +264,7 @@ class HotstarPlatform:
             show_name = show_slug.replace("-", " ").title()
             online_episodes = search_all_episodes_from_internet(show_name, show_slug, show_id, "Hotstar")
             if online_episodes:
-                return online_episodes
+                return sorted(online_episodes, key=episode_sort_key, reverse=True)
         except Exception as e:
             print(f"[!] Hotstar online episode discovery warning: {e}")
 

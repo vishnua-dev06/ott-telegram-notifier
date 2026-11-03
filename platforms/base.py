@@ -46,3 +46,31 @@ def extract_thumbnail_url(ep_entry: dict) -> str | None:
 
     return None
 
+
+
+# ---------------------------------------------------------------------------
+# Link-correctness helpers (shared by all platforms)
+# ---------------------------------------------------------------------------
+# Matches both  .../shows/<show-slug>/<show_id>/<ep-slug>/<ep_id>/watch  and without /watch
+HOTSTAR_EP_RE = re.compile(
+    r"hotstar\.com/(?:[a-z]{2}/)?shows/([^/?#\s\"']+)/(\d+)/([^/?#\s\"']+)/(\d{8,12})(?:/watch)?"
+)
+
+
+def has_episode_number(text: str, ep_number: str) -> bool:
+    """
+    True only when `ep_number` appears as a *whole* number (not inside a longer
+    number such as a 10-digit content id). '1116' matches 'Episode 1116' but not
+    '1641039866' or '11160'.
+    """
+    if not text or not ep_number:
+        return False
+    return re.search(rf"(?<!\d){re.escape(str(ep_number))}(?!\d)", str(text)) is not None
+
+
+def episode_sort_key(ep: dict) -> int:
+    """Sort key so the highest episode number comes first (real 'latest')."""
+    raw = str(ep.get("episode_number") or "")
+    if not raw.isdigit():
+        raw, _ = parse_episode_details(str(ep.get("title", "")))
+    return int(raw) if str(raw).isdigit() else -1

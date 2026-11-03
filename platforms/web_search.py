@@ -3,6 +3,7 @@ import html
 import re
 import urllib.parse
 import requests
+from platforms.base import HOTSTAR_EP_RE, has_episode_number
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -114,207 +115,144 @@ def search_yahoo(query: str) -> list[str]:
     return links
 
 
+DOMAINS = {
+    "hotstar": "hotstar.com",
+    "zee5": "zee5.com",
+    "sonyliv": "sonyliv.com",
+    "sunnxt": "sunnxt.com",
+    "manoramamax": "manoramamax.com",
+}
+
+
 def _extract_ep_number(title: str, url: str) -> str | None:
-    """Extracts episode number from title or URL."""
-    # Matches "Episode 1114", "Ep 1114", "E1114", "Episode: 1114"
-    match = re.search(r'(?:Episode|Ep|E)[.\s:-]*(\d+)', title, re.IGNORECASE)
+    """Extracts the episode number from a result title or URL (never from a long content id)."""
+    match = re.search(r'(?:Episode|Ep|E)[.\s:-]*(\d{1,5})(?!\d)', title or "", re.IGNORECASE)
     if match:
         return match.group(1)
-    match_url = re.search(r'episode-(\d+)', url, re.IGNORECASE)
+    match_url = re.search(r'episode-(\d{1,5})(?!\d)', url or "", re.IGNORECASE)
     if match_url:
         return match_url.group(1)
-    # Standalone 3-4 digit number
-    match_num = re.search(r'\b(\d{2,4})\b', title)
+    match_num = re.search(r'(?<!\d)(\d{2,4})(?!\d)', title or "")
     if match_num:
         return match_num.group(1)
     return None
 
 
-def search_all_episodes_from_internet(show_name: str, show_slug: str, show_id: str,
-                                      platform: str) -> list[dict]:
+def _hotstar_episode(title: str, link: str, show_slug: str, show_id: str) -> dict | None:
     """
-    Crawls internet search engines (DDG Lite, Bing, Yahoo) to discover all indexed episodes
-    for the given show on any platform.
-    Returns a list of parsed episode dictionaries.
+    Turns a search result into an episode dict ONLY if the URL is a real episode of this show:
+    /shows/<slug>/<show_id>/<ep-slug>/<ep_id>  with the SAME show_id and a different 8-12 digit ep id.
     """
-    plat_lower = platform.lower()
-    domain = "hotstar.com"
-    if plat_lower == "zee5":
-        domain = "zee5.com"
-    elif plat_lower == "sonyliv":
-        domain = "sonyliv.com"
-    elif plat_lower == "sunnxt":
-        domain = "sunnxt.com"
-    elif plat_lower == "manoramamax":
-        domain = "manoramamax.com"
+    m = HOTSTAR_EP_RE.search(link)
+    if not m:
+        return None
+    _slug, link_show_id, ep_slug, ep_id = m.groups()
+    if link_show_id != str(show_id) or ep_id == str(show_id):
+        return None
+    ep_num = _extract_ep_number(title, ep_slug) or ""
+    ep_name = ep_slug.replace("-", " ").title()
+    return {
+        "id": ep_id,
+        "title": f"Episode {ep_num} - {ep_name}" if ep_num else ep_name,
+        "episode_name": ep_name,
+        "episode_number": ep_num,
+        "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch",
+        "season_number": "1",
+        "_result_title": title,
+    }
 
-    # Multi-engine discovery
-    raw_results: list[tuple[str, str]] = []  # (title, url)
 
-    # 1. DuckDuckGo Lite
-    ddg_lite = search_duckduckgo_lite(f"site:{domain} {show_name}")
-    raw_results.extend(ddg_lite)
+def _generic_episode(title: str, link: str, show_slug: str, domain: str) -> dict | None:
+    """Zee5 / SonyLIV / SunNXT / ManoramaMAX: link must be on the right domain and mention the show."""
+    if domain not in link or not any(x in link for x in ("watch", "details", "shows", "detail", "programs", "tv-shows")):
+        return None
+    if show_slug and show_slug.lower() not in link.lower():
+        return None
+    ep_num = _extract_ep_number(title, link) or ""
+    return {
+        "id": link,
+        "title": title or (f"Episode {ep_num}" if ep_num else "Episode"),
+        "episode_name": title or f"Episode {ep_num}",
+        "episode_number": ep_num,
+        "url": link,
+        "season_number": "1",
+        "_result_title": title,
+    }
 
-    # 2. Bing
-    bing_links = search_bing(f"site:{domain} {show_name} episode")
-    for link in bing_links:
-        raw_results.append((f"Episode on {platform}", link))
 
-    # 3. Yahoo
-    yahoo_links = search_yahoo(f"site:{domain} {show_name} watch")
-    for link in yahoo_links:
-        raw_results.append((f"Episode on {platform}", link))
+def _collect_results(queries_ddg: list[str], queries_bing: list[str], queries_yahoo: list[str], platform: str) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = []
+    for q in queries_ddg:
+        results.extend(search_duckduckgo_lite(q))
+    for q in queries_bing:
+        results.extend((f"Episode on {platform}", l) for l in search_bing(q))
+    for q in queries_yahoo:
+        results.extend((f"Episode on {platform}", l) for l in search_yahoo(q))
+    return results
 
-    episodes = []
-    seen_ids = set()
 
-    for title, u in raw_results:
-        if plat_lower == "hotstar":
-            # Matches /shows/<slug>/<show_id>/<ep_slug>/<ep_id>/watch or without /watch
-            match_full = re.search(r'shows/[^/]+/\d+/([^/]+)/(\d{8,12})', u)
-            if match_full:
-                ep_slug = match_full.group(1)
-                ep_id = match_full.group(2)
-                if ep_id != show_id and ep_id not in seen_ids:
-                    seen_ids.add(ep_id)
-                    ep_num = _extract_ep_number(title, u) or ""
-                    ep_name = ep_slug.replace("-", " ").title()
-                    watch_url = f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch"
-                    episodes.append({
-                        "id": ep_id,
-                        "title": f"Episode {ep_num} - {ep_name}" if ep_num else ep_name,
-                        "episode_name": ep_name,
-                        "episode_number": ep_num,
-                        "url": watch_url,
-                        "season_number": "1",
-                    })
-                continue
-
-            # Matches /<ep_id>/watch
-            match_num = re.search(r'/(\d{8,12})(?:/watch)?', u)
-            if match_num:
-                ep_id = match_num.group(1)
-                if ep_id != show_id and ep_id not in seen_ids:
-                    seen_ids.add(ep_id)
-                    ep_num = _extract_ep_number(title, u) or ""
-                    watch_url = f"https://www.hotstar.com/{ep_id}/watch"
-                    episodes.append({
-                        "id": ep_id,
-                        "title": f"Episode {ep_num}" if ep_num else f"Episode {ep_id}",
-                        "episode_name": f"Episode {ep_num}" if ep_num else "Episode",
-                        "episode_number": ep_num,
-                        "url": watch_url,
-                        "season_number": "1",
-                    })
-        else:
-            # Zee5, SonyLIV, SunNXT, ManoramaMAX
-            if u not in seen_ids and any(x in u for x in ["watch", "details", "shows"]):
-                seen_ids.add(u)
-                ep_num = _extract_ep_number(title, u) or ""
-                episodes.append({
-                    "id": ep_num or u,
-                    "title": title or f"Episode {ep_num}",
-                    "episode_name": title or f"Episode {ep_num}",
-                    "episode_number": ep_num,
-                    "url": u,
-                    "season_number": "1",
-                })
-
+def search_all_episodes_from_internet(show_name: str, show_slug: str, show_id: str, platform: str) -> list[dict]:
+    """Discovers indexed episodes of THIS show through public search engines."""
+    plat = platform.lower()
+    domain = DOMAINS.get(plat, "hotstar.com")
+    raw = _collect_results(
+        [f"site:{domain} {show_name}"],
+        [f"site:{domain} {show_name} episode"],
+        [f"site:{domain} {show_name} watch"],
+        platform,
+    )
+    episodes, seen = [], set()
+    for title, link in raw:
+        ep = (_hotstar_episode(title, link, show_slug, show_id) if plat == "hotstar"
+              else _generic_episode(title, link, show_slug, domain))
+        if ep and ep["id"] not in seen:
+            seen.add(ep["id"])
+            episodes.append(ep)
     return episodes
 
 
 def search_exact_episode_from_internet(show_name: str, show_slug: str, show_id: str,
                                        ep_number: str, platform: str) -> dict | None:
     """
-    Searches public internet search indexes to find the 100% exact,
-    live episode watch URL and title for any OTT platform.
-    Bypasses datacenter IP blocks, geo-blocks, and Akamai restrictions.
+    Finds the live watch URL of ONE specific episode.
+    A result is accepted only if (a) the URL belongs to this show and (b) the episode number
+    appears as a whole number in the result title / URL slug. Otherwise returns None so the
+    caller shows the show page instead of a wrong episode.
     """
-    plat_lower = platform.lower()
-    domain = "hotstar.com"
-    if plat_lower == "zee5":
-        domain = "zee5.com"
-    elif plat_lower == "sonyliv":
-        domain = "sonyliv.com"
-    elif plat_lower == "sunnxt":
-        domain = "sunnxt.com"
-    elif plat_lower == "manoramamax":
-        domain = "manoramamax.com"
-
-    # Targeted search queries for the specific episode
-    targeted_queries = [
-        f"site:{domain} {show_name} {ep_number}",
+    plat = platform.lower()
+    domain = DOMAINS.get(plat, "hotstar.com")
+    queries = [
         f"site:{domain} {show_name} Episode {ep_number}",
+        f"site:{domain} {show_name} {ep_number}",
         f"site:{domain} {show_slug} {ep_number}",
-        f"{platform} {show_name} episode {ep_number} watch online",
     ]
 
-    for q in targeted_queries:
-        # Check DDG Lite
-        ddg_results = search_duckduckgo_lite(q)
-        for title, link in ddg_results:
-            ep_n = _extract_ep_number(title, link)
-            if ep_n == ep_number or ep_number in title or ep_number in link:
-                if plat_lower == "hotstar":
-                    match_full = re.search(r'shows/[^/]+/\d+/([^/]+)/(\d{8,12})', link)
-                    if match_full:
-                        ep_slug = match_full.group(1)
-                        ep_id = match_full.group(2)
-                        if ep_id != show_id:
-                            ep_name = ep_slug.replace("-", " ").title()
-                            return {
-                                "id": ep_id,
-                                "title": f"Episode {ep_number} - {ep_name}",
-                                "episode_name": ep_name,
-                                "episode_number": ep_number,
-                                "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch",
-                                "season_number": "1",
-                            }
-                    match_num = re.search(r'/(\d{8,12})(?:/watch)?', link)
-                    if match_num:
-                        ep_id = match_num.group(1)
-                        if ep_id != show_id:
-                            return {
-                                "id": ep_id,
-                                "title": f"Episode {ep_number}",
-                                "episode_name": f"Episode {ep_number}",
-                                "episode_number": ep_number,
-                                "url": f"https://www.hotstar.com/{ep_id}/watch",
-                                "season_number": "1",
-                            }
-                else:
-                    return {
-                        "id": ep_number,
-                        "title": title or f"Episode {ep_number}",
-                        "episode_name": title or f"Episode {ep_number}",
-                        "episode_number": ep_number,
-                        "url": link,
-                        "season_number": "1",
-                    }
-
-        # Check Bing
-        bing_links = search_bing(q)
-        for link in bing_links:
-            if plat_lower == "hotstar":
-                match_full = re.search(r'shows/[^/]+/\d+/([^/]+)/(\d{8,12})', link)
-                if match_full:
-                    ep_slug = match_full.group(1)
-                    ep_id = match_full.group(2)
-                    if ep_id != show_id:
-                        ep_name = ep_slug.replace("-", " ").title()
-                        return {
-                            "id": ep_id,
-                            "title": f"Episode {ep_number} - {ep_name}",
-                            "episode_name": ep_name,
-                            "episode_number": ep_number,
-                            "url": f"https://www.hotstar.com/in/shows/{show_slug}/{show_id}/{ep_slug}/{ep_id}/watch",
-                            "season_number": "1",
-                        }
-
-    # Broad crawl fallback: fetch all indexed show episodes
-    all_eps = search_all_episodes_from_internet(show_name, show_slug, show_id, platform)
-    for ep in all_eps:
-        if ep.get("episode_number") == ep_number or ep_number in ep.get("title", ""):
+    def accept(ep: dict | None) -> dict | None:
+        if not ep:
+            return None
+        blob = f"{ep.get('_result_title', '')} {ep['url']}"
+        # strip the numeric ids from the URL before matching the episode number
+        blob = re.sub(r"/\d{8,12}", "", blob)
+        if has_episode_number(blob, ep_number):
+            ep["episode_number"] = ep_number
+            if not re.search(r"(?<!\d)" + re.escape(ep_number) + r"(?!\d)", ep["title"]):
+                ep["title"] = f"Episode {ep_number} - {ep['title']}"
+            ep.pop("_result_title", None)
             return ep
+        return None
 
+    for q in queries:
+        candidates = list(search_duckduckgo_lite(q)) + [(f"Episode on {platform}", l) for l in search_bing(q)]
+        for title, link in candidates:
+            ep = (_hotstar_episode(title, link, show_slug, show_id) if plat == "hotstar"
+                  else _generic_episode(title, link, show_slug, domain))
+            hit = accept(ep)
+            if hit:
+                return hit
+
+    # Broad crawl fallback (same strict rules)
+    for ep in search_all_episodes_from_internet(show_name, show_slug, show_id, platform):
+        hit = accept(ep)
+        if hit:
+            return hit
     return None

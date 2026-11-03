@@ -4,6 +4,7 @@ from platforms.zee5 import Zee5Platform
 from platforms.sonyliv import SonyLIVPlatform
 from platforms.sunnxt import SunNXTPlatform
 from platforms.manoramamax import ManoramaMAXPlatform
+from platforms.base import episode_sort_key
 from platforms.web_search import search_exact_episode_from_internet, search_all_episodes_from_internet
 
 PLATFORMS = [
@@ -71,7 +72,9 @@ def fetch_episodes(show_url: str, platform_name: str) -> list[dict]:
     if clean_url.endswith("/watch"):
         clean_url = clean_url[:-6]
     handler = get_platform_handler(platform_name)
-    return handler.fetch_episodes(clean_url)
+    episodes = handler.fetch_episodes(clean_url) or []
+    # Newest first, so episodes[0] is the real latest episode (not just the first one scraped)
+    return sorted([e for e in episodes if e], key=episode_sort_key, reverse=True)
 
 
 def build_watch_link(show_slug: str, show_id: str, ep_name: str, ep_id: str, platform_name: str, raw_url: str = None) -> str:
