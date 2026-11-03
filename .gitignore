@@ -1,0 +1,27 @@
+# Environment variables & secrets
+.env
+
+# Data & database files
+shows_data.json
+seen_episodes.json
+*.db
+*.sqlite
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
