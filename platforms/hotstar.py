@@ -14,13 +14,31 @@ class HotstarPlatform:
         return any(d in url.lower() for d in cls.DOMAINS)
 
     @classmethod
-    def parse_url(cls, url: str) -> tuple[str, str, str] | None:
-        """Extract (slug, show_id, serial_name) from Hotstar show link."""
-        match = re.search(r"hotstar\.com/(?:[a-z]{2}/)?shows/([^/]+)/(\d+)", url)
+    def parse_url(cls, url: str) -> tuple[str, str, str, str] | None:
+        """
+        Extracts (slug, show_id, serial_name, canonical_url) from ANY Hotstar link.
+        Automatically converts unsupported watch links like:
+          https://www.hotstar.com/in/shows/bigg-boss/17932/watch
+        Into canonical series URLs:
+          https://www.hotstar.com/in/shows/bigg-boss/17932
+        """
+        clean = url.split("?")[0].rstrip("/")
+
+        # Match /shows/<slug>/<show_id>(/watch or /any/subpath)?
+        match = re.search(r"hotstar\.com/(?:[a-z]{2}/)?shows/([^/]+)/(\d+)", clean)
         if match:
             slug, show_id = match.group(1), match.group(2)
             serial_name = " ".join(w.capitalize() for w in slug.split("-"))
-            return slug, show_id, serial_name
+            canonical_url = f"https://www.hotstar.com/in/shows/{slug}/{show_id}"
+            return slug, show_id, serial_name, canonical_url
+
+        # Match short ID format: /<id>/watch
+        match_short = re.search(r"hotstar\.com/(?:[a-z]{2}/)?(\d+)(?:/watch)?", clean)
+        if match_short:
+            content_id = match_short.group(1)
+            canonical_url = f"https://www.hotstar.com/in/shows/{content_id}"
+            return content_id, content_id, f"Show {content_id}", canonical_url
+
         return None
 
     @classmethod
@@ -34,10 +52,15 @@ class HotstarPlatform:
 
     @classmethod
     def fetch_episodes(cls, show_url: str) -> list[dict]:
-        """Scrapes episodes using direct Next.js webpage parser (avoids 475 geo-block), with yt-dlp fallback."""
+        """Scrapes episodes using direct Next.js webpage parser with yt-dlp fallback."""
+        # Sanitize URL: strip /watch and trailing query/hashes
+        clean_url = show_url.split("?")[0].rstrip("/")
+        if clean_url.endswith("/watch"):
+            clean_url = clean_url[:-6]
+
         headers = {**COMMON_HEADERS, "Referer": "https://www.hotstar.com/"}
         try:
-            resp = requests.get(show_url, headers=headers, timeout=15)
+            resp = requests.get(clean_url, headers=headers, timeout=15)
             if resp.status_code == 200:
                 html = resp.text
                 entries = []
@@ -103,7 +126,7 @@ class HotstarPlatform:
         except Exception as e:
             print(f"[!] Hotstar web scraper error: {e}")
 
-        # Fallback to yt-dlp
+        # Fallback to yt-dlp using cleaned series URL
         ydl_opts = {
             "extract_flat": "in_playlist",
             "skip_download": True,
@@ -113,9 +136,8 @@ class HotstarPlatform:
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
-                info = ydl.extract_info(show_url, download=False)
+                info = ydl.extract_info(clean_url, download=False)
                 return info.get("entries", []) if info else []
             except Exception as e:
                 print(f"[!] yt-dlp Hotstar fallback error: {e}")
                 return []
-

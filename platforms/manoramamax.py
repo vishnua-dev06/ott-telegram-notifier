@@ -12,13 +12,15 @@ class ManoramaMAXPlatform:
         return any(d in url.lower() for d in cls.DOMAINS)
 
     @classmethod
-    def parse_url(cls, url: str) -> tuple[str, str, str] | None:
-        """Extract (slug, show_id, serial_name) from ManoramaMAX show link."""
-        match = re.search(r"manoramamax\.com/(?:[a-z]{2}/)?(?:shows|programs)/([a-zA-Z0-9_-]+)", url)
+    def parse_url(cls, url: str) -> tuple[str, str, str, str] | None:
+        """Extract (slug, show_id, serial_name, canonical_url) from ManoramaMAX show link."""
+        clean = url.split("?")[0].rstrip("/")
+        match = re.search(r"manoramamax\.com/(?:[a-z]{2}/)?(?:shows|programs)/([a-zA-Z0-9_-]+)", clean)
         if match:
             slug = match.group(1)
             serial_name = " ".join(w.capitalize() for w in slug.split("-"))
-            return slug, slug, serial_name
+            canonical_url = f"https://www.manoramamax.com/programs/{slug}"
+            return slug, slug, serial_name, canonical_url
         return None
 
     @classmethod

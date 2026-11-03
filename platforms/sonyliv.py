@@ -12,13 +12,15 @@ class SonyLIVPlatform:
         return any(d in url.lower() for d in cls.DOMAINS)
 
     @classmethod
-    def parse_url(cls, url: str) -> tuple[str, str, str] | None:
-        """Extract (slug, show_id, serial_name) from SonyLIV show link."""
-        match = re.search(r"sonyliv\.com/(?:[a-z]{2}/)?shows/([a-zA-Z0-9_-]+)", url)
+    def parse_url(cls, url: str) -> tuple[str, str, str, str] | None:
+        """Extract (slug, show_id, serial_name, canonical_url) from SonyLIV show link."""
+        clean = url.split("?")[0].rstrip("/")
+        match = re.search(r"sonyliv\.com/(?:[a-z]{2}/)?shows/([a-zA-Z0-9_-]+)", clean)
         if match:
             slug = match.group(1)
             serial_name = " ".join(w.capitalize() for w in slug.split("-"))
-            return slug, slug, serial_name
+            canonical_url = f"https://www.sonyliv.com/shows/{slug}"
+            return slug, slug, serial_name, canonical_url
         return None
 
     @classmethod

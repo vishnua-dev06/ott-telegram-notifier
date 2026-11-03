@@ -222,10 +222,10 @@ async def cmd_addshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Could not parse show URL. Please check the link and try again.", parse_mode="HTML")
         return
 
-    show_slug, show_id, serial_name, platform = parsed
+    show_slug, show_id, serial_name, platform, canonical_url = parsed
     status_msg = await update.message.reply_text(f"⏳ Inspecting <b>{serial_name}</b> on <b>{platform}</b>...", parse_mode="HTML")
 
-    entries = await asyncio.to_thread(fetch_episodes, url, platform)
+    entries = await asyncio.to_thread(fetch_episodes, canonical_url, platform)
     existing_show = db.db_get_show(show_id)
 
     if not existing_show:
@@ -236,7 +236,7 @@ async def cmd_addshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "serial_name": serial_name,
             "language": language,
             "from_ott": platform,
-            "url": url,
+            "url": canonical_url,
             "subscribers": [chat_id],
             "seen_episode_ids": seen_ids,
             "cached_episodes": entries[:30],

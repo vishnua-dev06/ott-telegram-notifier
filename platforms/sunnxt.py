@@ -12,13 +12,15 @@ class SunNXTPlatform:
         return any(d in url.lower() for d in cls.DOMAINS)
 
     @classmethod
-    def parse_url(cls, url: str) -> tuple[str, str, str] | None:
-        """Extract (slug, show_id, serial_name) from SunNXT show link."""
-        match = re.search(r"sunnxt\.com/([^/]+)/([a-zA-Z0-9_-]+)", url)
+    def parse_url(cls, url: str) -> tuple[str, str, str, str] | None:
+        """Extract (slug, show_id, serial_name, canonical_url) from SunNXT show link."""
+        clean = url.split("?")[0].rstrip("/")
+        match = re.search(r"sunnxt\.com/([^/]+)/([a-zA-Z0-9_-]+)", clean)
         if match:
             slug, show_id = match.group(1), match.group(2)
             serial_name = " ".join(w.capitalize() for w in slug.split("-"))
-            return slug, show_id, serial_name
+            canonical_url = f"https://www.sunnxt.com/{slug}/{show_id}"
+            return slug, show_id, serial_name, canonical_url
         return None
 
     @classmethod
