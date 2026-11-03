@@ -359,34 +359,65 @@ async def cmd_getepisode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from_ott = matched_show.get("from_ott", "Hotstar")
     episodes = matched_show.get("cached_episodes") or []
+
+    # If cache is empty, attempt a fresh scrape
     if not episodes:
         episodes = await asyncio.to_thread(fetch_episodes, matched_show["url"], from_ott)
         if episodes:
             db.db_update_cached_episodes(matched_show["show_id"], episodes)
 
-    if not episodes:
-        await status_msg.edit_text("❌ Could not retrieve episodes for this show at the moment.")
-        return
-
     target_ep = None
-    if ep_num_query:
-        for ep in episodes:
-            raw_title = str(ep.get("title", ""))
-            ep_n, _ = parse_episode_details(raw_title)
-            if ep_n == ep_num_query or f"episode {ep_num_query}" in raw_title.lower() or f"ep {ep_num_query}" in raw_title.lower():
-                target_ep = ep
-                break
-    else:
-        target_ep = episodes[0]
+    if episodes:
+        if ep_num_query:
+            for ep in episodes:
+                raw_title = str(ep.get("title", ""))
+                ep_n, _ = parse_episode_details(raw_title)
+                if (
+                    ep_n == ep_num_query
+                    or f"episode {ep_num_query}" in raw_title.lower()
+                    or f"ep {ep_num_query}" in raw_title.lower()
+                    or f"- {ep_num_query}" in raw_title
+                    or raw_title.endswith(f" {ep_num_query}")
+                ):
+                    target_ep = ep
+                    break
+        else:
+            target_ep = episodes[0]
 
+    # Fallback if specific episode wasn't found in list or scraper was throttled
     if not target_ep:
-        await status_msg.edit_text(f"❌ Could not find Episode <b>{ep_num_query}</b> for {matched_show['serial_name']}.", parse_mode="HTML")
-        return
+        if ep_num_query:
+            target_ep = {
+                "id": matched_show["show_id"],
+                "title": f"Episode {ep_num_query}",
+                "season_number": "1",
+                "url": matched_show["url"],
+            }
+        elif episodes:
+            target_ep = episodes[0]
+        else:
+            # Construct latest episode details from show
+            seen = matched_show.get("seen_episode_ids", [])
+            latest_id = str(seen[-1]) if seen else matched_show["show_id"]
+            target_ep = {
+                "id": latest_id,
+                "title": "Latest Episode",
+                "season_number": "1",
+                "url": matched_show["url"],
+            }
 
-    await status_msg.delete()
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     raw_title = target_ep.get("title", "Episode")
     ep_num, ep_name = parse_episode_details(raw_title)
+    if ep_num_query and (not ep_num or ep_num == "Latest"):
+        ep_num = ep_num_query
+        if ep_name == "Episode" or ep_name == "Latest Episode":
+            ep_name = f"Episode {ep_num_query}"
+
     season_num = str(target_ep.get("season_number") or "1")
     ep_id = str(target_ep.get("id"))
     thumbnail_url = extract_thumbnail_url(target_ep)
