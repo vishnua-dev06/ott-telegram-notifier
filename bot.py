@@ -2,6 +2,8 @@ import os
 import re
 import json
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
@@ -19,7 +21,32 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))
 DATA_FILE = os.getenv("DATA_FILE", "shows_data.json")
+PORT = int(os.getenv("PORT", "8080"))
 # ==============================================================
+
+
+# ------------------ DUMMY HTTP SERVER FOR KOYEB / CLOUD HEALTH CHECKS ------------------
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Responds to cloud platform health checks (Koyeb, Render, etc.)."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - Hotstar Telegram Notifier is running!")
+
+    def log_message(self, format, *args):
+        # Silence access logs to keep output clean
+        return
+
+
+def start_health_server():
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+        print(f"[*] Health check server active on port {PORT} (Koyeb/Cloud compatible)")
+        server.serve_forever()
+    except Exception as e:
+        print(f"[!] Health check server warning: {e}")
+
 
 
 # ------------------ DATA PERSISTENCE ------------------
@@ -332,8 +359,11 @@ async def post_init(application: Application):
 def main():
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
         print("[!] ERROR: TELEGRAM_BOT_TOKEN is not set.")
-        print("[!] Create a .env file with your token or export TELEGRAM_BOT_TOKEN in your environment.")
+        print("[!] Create a .env file with your token or set TELEGRAM_BOT_TOKEN in your environment.")
         return
+
+    # Start dummy HTTP health check server for Koyeb / Web Service health checks
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     print("[*] Starting Telegram Bot with interactive show management...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
@@ -349,3 +379,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

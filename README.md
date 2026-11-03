@@ -100,3 +100,4 @@ docker compose up -d --build
 
 ## 📄 License
 This project is for educational and personal notification purposes only.
+

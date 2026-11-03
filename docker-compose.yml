@@ -6,3 +6,4 @@ services:
       - .env
     volumes:
       - ./shows_data.json:/app/shows_data.json
+
