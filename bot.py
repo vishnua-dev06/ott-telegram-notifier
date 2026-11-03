@@ -6,6 +6,8 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from dotenv import load_dotenv
+import requests
+import telegram.error
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -253,16 +255,14 @@ def db_remove_user(user_id: int):
 
 # ------------------ PERMISSIONS & ROLES ------------------
 def is_admin(user_id: int) -> bool:
-    """Check if user matches the configured ADMIN_ID."""
     if not ADMIN_ID:
-        return True  # If no ADMIN_ID configured, anyone can run admin commands
+        return True
     return str(user_id) == str(ADMIN_ID)
 
 
 def is_authorized(user_id: int) -> bool:
-    """Check if user is authorized to use the bot."""
     if not ADMIN_ID:
-        return True  # No auth restriction if ADMIN_ID is empty
+        return True
     if is_admin(user_id):
         return True
     return user_id in db_get_authorized_users()
@@ -338,7 +338,6 @@ def format_notification(serial_name: str, ep_name: str, ep_number: str,
 
 
 def extract_thumbnail_url(ep_entry: dict) -> str | None:
-    """Extract best quality thumbnail from yt-dlp entry."""
     thumb = ep_entry.get("thumbnail")
     if thumb and isinstance(thumb, str) and thumb.startswith("http"):
         return thumb
@@ -357,7 +356,6 @@ def extract_thumbnail_url(ep_entry: dict) -> str | None:
 
 
 def build_inline_keyboard(watch_link: str) -> InlineKeyboardMarkup:
-    """Creates interactive 'Watch Now' and 'Share' buttons."""
     keyboard = [
         [InlineKeyboardButton("🎬 Watch on JioHotstar", url=watch_link)],
         [InlineKeyboardButton("↗️ Share Episode", url=f"https://t.me/share/url?url={watch_link}&text=New%20Episode%20Released!")]
@@ -366,7 +364,6 @@ def build_inline_keyboard(watch_link: str) -> InlineKeyboardMarkup:
 
 
 async def send_episode_alert(bot, chat_id: int, alert_text: str, watch_link: str, thumbnail_url: str = None) -> bool:
-    """Sends notification with thumbnail banner and inline buttons."""
     reply_markup = build_inline_keyboard(watch_link)
 
     if thumbnail_url:
@@ -394,25 +391,146 @@ async def send_episode_alert(bot, chat_id: int, alert_text: str, watch_link: str
         return False
 
 
+# ------------------ DIRECT WEB SCRAPER (BYPASSES HTTP 475) ------------------
+def fetch_episodes_from_webpage(show_url: str) -> list[dict]:
+    """
+    Scrapes episode metadata directly from Hotstar's public Next.js webpage.
+    This bypasses the Akamai API geo-block (HTTP Error 475) returned by yt-dlp on cloud IPs.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.hotstar.com/",
+    }
+    try:
+        resp = requests.get(show_url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"[!] Hotstar web request returned status {resp.status_code}")
+            return []
+
+        html = resp.text
+        entries = []
+        seen_ids = set()
+
+        # 1. Parse Next.js __NEXT_DATA__
+        next_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html)
+        if next_match:
+            try:
+                data = json.loads(next_match.group(1))
+
+                def search_items(obj):
+                    if isinstance(obj, dict):
+                        c_id = str(obj.get("contentId") or obj.get("id") or "")
+                        title = obj.get("title") or obj.get("episodeTitle") or obj.get("name")
+                        if c_id and c_id.isdigit() and len(c_id) >= 8 and title and c_id not in seen_ids:
+                            # Verify if it looks like an episode asset
+                            is_ep = (
+                                obj.get("episodeNo") is not None
+                                or obj.get("episodeNumber") is not None
+                                or "watch" in str(obj.get("url", ""))
+                                or obj.get("assetType") in ["EPISODE", "SHOW_EPISODE"]
+                                or "/watch" in str(obj)
+                            )
+                            if is_ep:
+                                seen_ids.add(c_id)
+                                ep_num = str(obj.get("episodeNo") or obj.get("episodeNumber") or "")
+                                thumb = None
+                                if isinstance(obj.get("images"), dict):
+                                    thumb = obj["images"].get("h") or obj["images"].get("v")
+                                elif isinstance(obj.get("image"), str):
+                                    thumb = obj.get("image")
+
+                                entries.append({
+                                    "id": c_id,
+                                    "title": f"Episode {ep_num} - {title}" if ep_num and ep_num not in str(title) else str(title),
+                                    "thumbnail": thumb,
+                                    "season_number": str(obj.get("seasonNo") or obj.get("seasonNumber") or "1"),
+                                })
+                        for v in obj.values():
+                            search_items(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            search_items(item)
+
+                search_items(data)
+            except Exception as json_err:
+                print(f"[!] Error parsing __NEXT_DATA__: {json_err}")
+
+        # 2. Extract direct watch links from HTML
+        link_matches = re.findall(r'href="([^"]*?/shows/[^/]+/\d+/([^/]+)/(\d{8,12})/watch)"', html)
+        for full_link, ep_slug, ep_id in link_matches:
+            if ep_id not in seen_ids:
+                seen_ids.add(ep_id)
+                clean_title = ep_slug.replace("-", " ").title()
+                entries.append({
+                    "id": ep_id,
+                    "title": clean_title,
+                    "url": f"https://www.hotstar.com{full_link}" if full_link.startswith("/") else full_link
+                })
+
+        # 3. JSON-LD fallback
+        json_ld_matches = re.findall(r'<script type="application/ld\+json"[^>]*>([\s\S]*?)</script>', html)
+        for jld in json_ld_matches:
+            try:
+                ld = json.loads(jld)
+                itemList = ld.get("itemListElement") or ld.get("episodes") or []
+                if isinstance(itemList, list):
+                    for it in itemList:
+                        it_url = it.get("url", "")
+                        match_id = re.search(r'/(\d{8,12})(?:/watch)?', it_url)
+                        if match_id:
+                            eid = match_id.group(1)
+                            if eid not in seen_ids:
+                                seen_ids.add(eid)
+                                entries.append({
+                                    "id": eid,
+                                    "title": it.get("name") or "New Episode",
+                                    "thumbnail": it.get("image"),
+                                })
+            except Exception:
+                pass
+
+        if entries:
+            print(f"[✓] Direct web scraper successfully found {len(entries)} episodes from Hotstar!")
+            return entries
+
+    except Exception as scrape_err:
+        print(f"[!] Direct web scraper error: {scrape_err}")
+
+    return []
+
+
 def fetch_episodes_sync(show_url: str) -> list[dict]:
+    """Combines direct web scraper with yt-dlp fallback."""
+    # 1. Try direct web scraper first (bypasses HTTP Error 475)
+    web_entries = fetch_episodes_from_webpage(show_url)
+    if web_entries:
+        return web_entries
+
+    # 2. Fallback to yt-dlp if web scraper returned empty
+    print("[*] Web scraper returned 0 entries. Attempting yt-dlp fallback...")
     ydl_opts = {
         "extract_flat": "in_playlist",
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://www.hotstar.com/",
+        }
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(show_url, download=False)
             return info.get("entries", []) if info else []
         except Exception as e:
-            print(f"[!] Error fetching {show_url}: {e}")
+            print(f"[!] yt-dlp extractor warning: {e}")
             return []
 
 
 # ------------------ TELEGRAM COMMAND HANDLERS ------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /start."""
     user_id = update.effective_user.id
     db_mode = f"MongoDB Atlas ({DATABASE_NAME})" if shows_col is not None else "Local Storage"
     auth_status = "✅ Authorized" if is_authorized(user_id) else "🔒 Unauthorized"
@@ -457,7 +575,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_addshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /addshow <url> [language]."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorized to use this command.")
@@ -517,7 +634,6 @@ async def cmd_addshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_removeshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /removeshow <id_or_name>."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorized to use this command.")
@@ -546,7 +662,6 @@ async def cmd_removeshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_listshows(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /listshows."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorized to use this command.")
@@ -571,7 +686,6 @@ async def cmd_listshows(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_checknow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /checknow - forces manual immediate check."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorized to trigger manual checks.")
@@ -583,7 +697,6 @@ async def cmd_checknow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /stats - bot health and metrics."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorized to view bot stats.")
@@ -610,7 +723,6 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /adduser <user_id> (Admin only)."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Only the Super Admin can authorize new users.")
         return
@@ -630,7 +742,6 @@ async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /removeuser <user_id> (Admin only)."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Only the Super Admin can revoke users.")
         return
@@ -654,7 +765,6 @@ async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /listusers (Admin only)."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Only the Super Admin can list users.")
         return
@@ -669,7 +779,6 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for /test - preview full notification with image and button."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("⛔ You are not authorized to use this command.")
@@ -685,14 +794,27 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from_ott="Hotstar",
         watch_link=watch_link
     )
-    # Sample high quality banner image for visual test
     sample_poster = "https://img10.hotstar.com/image/upload/f_auto,q_90,w_1200/sources/r1/cms/prod/8549/1648549-i-124b89dc1555"
     await send_episode_alert(context.bot, update.effective_chat.id, sample_text, watch_link, thumbnail_url=sample_poster)
 
 
+# ------------------ TELEGRAM ERROR HANDLER ------------------
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gracefully catches network and conflict errors without crash-looping."""
+    if isinstance(context.error, telegram.error.Conflict):
+        print("\n[⚠️ CONFLICT ERROR] Another instance of this bot is polling getUpdates!")
+        print("[⚠️ CONFLICT ERROR] 1. Stop 'python bot.py' if running locally on your PC.")
+        print("[⚠️ CONFLICT ERROR] 2. In Koyeb, verify Instance Count is set to 1 (not multiple replicas).\n")
+        await asyncio.sleep(5)
+    elif isinstance(context.error, telegram.error.NetworkError):
+        print(f"[!] Telegram network warning: {context.error}")
+        await asyncio.sleep(3)
+    else:
+        print(f"[!] Telegram unhandled error: {context.error}")
+
+
 # ------------------ BACKGROUND AUTO-MONITOR & CHECK ENGINE ------------------
 async def check_and_broadcast_episodes(app: Application) -> int:
-    """Core checking engine: checks all tracked shows and sends alerts. Returns count of new episodes found."""
     new_episodes_count = 0
     try:
         all_shows = db_get_all_shows()
@@ -732,7 +854,6 @@ async def check_and_broadcast_episodes(app: Application) -> int:
                     watch_link=watch_link
                 )
 
-                # Broadcast to all subscribers with photo banner & watch button
                 for chat_id in subscribers:
                     await send_episode_alert(
                         app.bot,
@@ -742,7 +863,6 @@ async def check_and_broadcast_episodes(app: Application) -> int:
                         thumbnail_url=thumbnail_url
                     )
 
-                # Mark as seen in database
                 db_add_seen_episode(show_id, ep_id)
                 seen_ids.add(ep_id)
                 new_episodes_count += 1
@@ -755,7 +875,6 @@ async def check_and_broadcast_episodes(app: Application) -> int:
 
 
 async def background_monitor(app: Application):
-    """Background loop running on CHECK_INTERVAL_SECONDS."""
     while True:
         await check_and_broadcast_episodes(app)
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
@@ -776,6 +895,9 @@ def main():
 
     print("[*] Starting Telegram Bot with visual upgrades & admin controls...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+
+    # Register Global Error Handler to catch Conflict / Network issues
+    app.add_error_handler(global_error_handler)
 
     # Commands
     app.add_handler(CommandHandler("start", cmd_start))
